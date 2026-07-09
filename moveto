@@ -1,0 +1,256 @@
+#!/bin/bash
+# moveto — move files to a destination, auto-handling FAT32 4 GB file-size limit.
+# Splits oversized files into playable segments, verifies before deleting source.
+#
+# Usage:
+#   moveto                          (interactive prompts)
+#   moveto <source_dir> <dest_dir>  (non-interactive)
+#   moveto --help
+
+set -uo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+MAX_FAT32_BYTES=4294967296   # 4 GiB hard limit
+SPLIT_SECS=60                # Segment length for splits (60 s is safe for VBR)
+VIDEO_EXTS="mov mp4 mkv avi m4v webm hevc"
+
+# ── Colours (silent if not a tty) ─────────────────────────────────────────────
+if [ -t 1 ]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+log()    { echo -e "${CYAN}[$(date '+%H:%M:%S')]${RESET} $*"; }
+ok()     { echo -e "${GREEN}  ✓${RESET} $*"; }
+fail()   { echo -e "${RED}  ✗${RESET} $*"; }
+header() { echo -e "\n${BOLD}$*${RESET}"; }
+warn()   { echo -e "${YELLOW}  ⚠${RESET} $*"; }
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+is_video() {
+  local ext="${1##*.}"
+  ext="${ext,,}"
+  for e in $VIDEO_EXTS; do [ "$e" = "$ext" ] && return 0; done
+  return 1
+}
+
+fmt_bytes() {
+  local b=$1
+  if   [ "$b" -ge 1073741824 ]; then printf "%.1f GB" "$(echo "scale=1; $b/1073741824" | bc)"
+  elif [ "$b" -ge 1048576 ];    then printf "%.0f MB"  "$(echo "scale=0; $b/1048576"    | bc)"
+  else printf "%d B" "$b"; fi
+}
+
+is_fat32() {
+  diskutil info "$1" 2>/dev/null | grep -qiE 'fat.?32|msdos'
+}
+
+verify_file() {
+  local dst="$1" expected_size="${2:-0}"
+  [ -f "$dst" ] || { fail "not found at destination: $(basename "$dst")"; return 1; }
+  local sz; sz=$(stat -f "%z" "$dst")
+  [ "$sz" -gt 0 ] || { fail "zero-byte file: $(basename "$dst")"; return 1; }
+  if [ "$expected_size" -gt 0 ] && [ "$sz" -ne "$expected_size" ]; then
+    fail "size mismatch (expected $(fmt_bytes "$expected_size"), got $(fmt_bytes "$sz")): $(basename "$dst")"
+    return 1
+  fi
+  if is_video "$dst"; then
+    ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 "$dst" &>/dev/null \
+      || { fail "not playable by ffprobe: $(basename "$dst")"; return 1; }
+  fi
+  return 0
+}
+
+usage() {
+  cat <<EOF
+${BOLD}moveto${RESET} — move files to a destination, splitting files > 4 GB for FAT32 drives.
+
+  ${CYAN}Usage:${RESET}
+    moveto                          interactive (prompts for paths)
+    moveto <source_dir> <dest_dir>  non-interactive
+    moveto --help                   show this help
+
+  ${CYAN}Behaviour:${RESET}
+    • Auto-detects FAT32 destinations and enforces the 4 GB per-file limit.
+    • Files within the limit are copied directly.
+    • Oversized files are split into ${SPLIT_SECS}s playable segments (stream copy,
+      no re-encode) inside a subfolder named after the original file.
+    • Source files are deleted ONLY after the destination passes verification.
+    • Non-video files are verified by size; video files also by ffprobe.
+
+  ${CYAN}Requirements:${RESET}  ffmpeg / ffprobe  (brew install ffmpeg)
+EOF
+}
+
+# ── Argument handling ──────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; exit 0; fi
+
+SRC_DIR="${1:-}"
+DST_DIR="${2:-}"
+
+if [ -z "$SRC_DIR" ]; then echo -n "Source directory: ";      read -r SRC_DIR; fi
+if [ -z "$DST_DIR" ]; then echo -n "Destination directory: "; read -r DST_DIR; fi
+
+# Strip surrounding single or double quotes that users sometimes paste in
+strip_quotes() {
+  local s="$1"
+  [[ "$s" =~ ^\'(.*)\'$ ]] && s="${BASH_REMATCH[1]}"
+  [[ "$s" =~ ^\"(.*)\"$ ]] && s="${BASH_REMATCH[1]}"
+  # Also strip a trailing slash so paths are consistent
+  s="${s%/}"
+  echo "$s"
+}
+SRC_DIR=$(strip_quotes "$SRC_DIR")
+DST_DIR=$(strip_quotes "$DST_DIR")
+
+SRC_DIR="${SRC_DIR/#\~/$HOME}"
+DST_DIR="${DST_DIR/#\~/$HOME}"
+
+[ -d "$SRC_DIR" ] || { echo -e "${RED}Error:${RESET} source not found: $SRC_DIR"; exit 1; }
+[ -d "$DST_DIR" ] || { echo -e "${RED}Error:${RESET} destination not found: $DST_DIR"; exit 1; }
+command -v ffmpeg  &>/dev/null || { echo -e "${RED}Error:${RESET} ffmpeg not found — install with: brew install ffmpeg"; exit 1; }
+command -v ffprobe &>/dev/null || { echo -e "${RED}Error:${RESET} ffprobe not found — install with: brew install ffmpeg"; exit 1; }
+
+# ── Detect FAT32 ───────────────────────────────────────────────────────────────
+APPLY_LIMIT=false
+is_fat32 "$DST_DIR" && APPLY_LIMIT=true
+
+# ── Scan source ────────────────────────────────────────────────────────────────
+header "=== moveto ==="
+log "Source:      $SRC_DIR"
+log "Destination: $DST_DIR"
+if $APPLY_LIMIT; then
+  warn "FAT32 detected — files > 4 GB will be split into ${SPLIT_SECS}s segments."
+else
+  log "Destination filesystem has no 4 GB limit; copying directly."
+fi
+
+SMALL_FILES=(); LARGE_FILES=()
+while IFS= read -r f; do
+  sz=$(stat -f "%z" "$f")
+  if $APPLY_LIMIT && [ "$sz" -gt "$MAX_FAT32_BYTES" ]; then
+    LARGE_FILES+=("$f")
+  else
+    SMALL_FILES+=("$f")
+  fi
+done < <(find "$SRC_DIR" -maxdepth 1 -type f ! -name ".*" | sort)
+
+TOTAL=$(( ${#SMALL_FILES[@]} + ${#LARGE_FILES[@]} ))
+header "Found $TOTAL file(s): ${#SMALL_FILES[@]} direct-copy, ${#LARGE_FILES[@]} need splitting"
+[ "$TOTAL" -eq 0 ] && { warn "No files found in source directory."; exit 0; }
+
+# ── Step 1: Direct copy ────────────────────────────────────────────────────────
+FAILED=(); TO_DELETE=()
+
+[ "${#SMALL_FILES[@]}" -gt 0 ] && header "── Copying files ──"
+
+for src in "${SMALL_FILES[@]}"; do
+  name=$(basename "$src")
+  sz=$(stat -f "%z" "$src")
+  dst="$DST_DIR/$name"
+  log "Copying ($(fmt_bytes "$sz")): $name"
+  if cp "$src" "$dst" 2>/dev/null; then
+    if verify_file "$dst" "$sz"; then
+      ok "$name"
+      TO_DELETE+=("$src")
+    else
+      FAILED+=("$name")
+    fi
+  else
+    fail "cp failed: $name"
+    FAILED+=("$name")
+  fi
+done
+
+# ── Step 2: Split large files ──────────────────────────────────────────────────
+[ "${#LARGE_FILES[@]}" -gt 0 ] && header "── Splitting large files ──"
+
+for src in "${LARGE_FILES[@]}"; do
+  name=$(basename "$src")
+  noext="${name%.*}"
+  ext="${name##*.}"
+  sz=$(stat -f "%z" "$src")
+  subfolder="$DST_DIR/$noext"
+
+  log "Large file ($(fmt_bytes "$sz")): $name"
+
+  dur_raw=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1 "$src" 2>/dev/null)
+  duration="${dur_raw#duration=}"
+  if [ -z "$duration" ]; then
+    fail "could not probe duration — skipping $name"
+    FAILED+=("$name"); continue
+  fi
+
+  n_segs=$(python3 -c "import math; print(math.ceil(float('$duration') / $SPLIT_SECS))")
+  log "  Duration: ${duration}s → $n_segs segment(s) of up to ${SPLIT_SECS}s"
+  log "  Subfolder: $noext/"
+
+  mkdir -p "$subfolder" || { fail "mkdir failed: $subfolder"; FAILED+=("$name"); continue; }
+
+  if ! ffmpeg -hide_banner -loglevel warning \
+       -i "$src" \
+       -c copy -f segment -segment_time "$SPLIT_SECS" -reset_timestamps 1 \
+       "$subfolder/part%03d.$ext"; then
+    fail "ffmpeg failed for $name"
+    FAILED+=("$name"); continue
+  fi
+
+  seg_ok=true; seg_count=0
+  while IFS= read -r seg; do
+    seg_sz=$(stat -f "%z" "$seg")
+    seg_name=$(basename "$seg")
+    if [ "$seg_sz" -gt "$MAX_FAT32_BYTES" ]; then
+      fail "segment $seg_name is $(fmt_bytes "$seg_sz") — still exceeds FAT32 limit!"
+      warn "Extreme bitrate variation in this file. Edit SPLIT_SECS in moveto (currently $SPLIT_SECS s)."
+      seg_ok=false
+    elif verify_file "$seg"; then
+      ok "segment: $seg_name ($(fmt_bytes "$seg_sz"))"
+      seg_count=$((seg_count + 1))
+    else
+      seg_ok=false
+    fi
+  done < <(find "$subfolder" -maxdepth 1 -name "part*.*" | sort)
+
+  if $seg_ok && [ "$seg_count" -gt 0 ]; then
+    ok "$name → $seg_count segment(s) in $noext/"
+    TO_DELETE+=("$src")
+  else
+    fail "verification failed — source will NOT be deleted: $name"
+    FAILED+=("$name")
+  fi
+done
+
+# ── Summary & cleanup ──────────────────────────────────────────────────────────
+header "════════════════════════════"
+echo -e "  Verified:  ${GREEN}${#TO_DELETE[@]}${RESET} / $TOTAL"
+echo -e "  Failed:    ${RED}${#FAILED[@]}${RESET} / $TOTAL"
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  echo ""
+  warn "Failed (source left intact):"
+  for f in "${FAILED[@]}"; do echo "    ✗ $f"; done
+fi
+
+echo ""
+if [ "${#TO_DELETE[@]}" -gt 0 ]; then
+  if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo -n "Delete the ${#TO_DELETE[@]} successfully transferred source file(s)? [y/N] "
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { warn "Skipped deletion."; exit 1; }
+  fi
+  log "Deleting verified source files..."
+  for src in "${TO_DELETE[@]}"; do
+    rm "$src" && ok "Deleted: $(basename "$src")"
+  done
+  echo ""
+  if [ "${#FAILED[@]}" -eq 0 ]; then
+    echo -e "${GREEN}${BOLD}Done. All $TOTAL file(s) moved successfully.${RESET}"
+    exit 0
+  else
+    warn "${#FAILED[@]} file(s) failed — inspect manually."
+    exit 1
+  fi
+fi
