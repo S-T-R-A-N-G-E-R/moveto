@@ -7,7 +7,7 @@
 #   moveto <source_dir> <dest_dir>  (non-interactive)
 #   moveto --help
 
-set -uo pipefail
+set -o pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MAX_FAT32_BYTES=4294967296   # 4 GiB hard limit
@@ -30,8 +30,8 @@ warn()   { echo -e "${YELLOW}  ⚠${RESET} $*"; }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 is_video() {
-  local ext="${1##*.}"
-  ext="${ext,,}"
+  local ext
+  ext=$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')
   for e in $VIDEO_EXTS; do [ "$e" = "$ext" ] && return 0; done
   return 1
 }
@@ -44,7 +44,12 @@ fmt_bytes() {
 }
 
 is_fat32() {
-  diskutil info "$1" 2>/dev/null | grep -qiE 'fat.?32|msdos'
+  # Get the block device for the given path, then inspect it with diskutil.
+  # Using the device (e.g. /dev/disk5s1) works reliably regardless of how
+  # deep into the volume the destination path is.
+  local device
+  device=$(df "$1" 2>/dev/null | awk 'NR==2 {print $1}')
+  [ -n "$device" ] && diskutil info "$device" 2>/dev/null | grep -qiE 'fat.?32|msdos'
 }
 
 verify_file() {
