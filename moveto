@@ -85,7 +85,7 @@ ${BOLD}moveto${RESET} — move files to a destination, splitting files > 4 GB fo
     • Source files are deleted ONLY after the destination passes verification.
     • Non-video files are verified by size; video files also by ffprobe.
 
-  ${CYAN}Requirements:${RESET}  ffmpeg / ffprobe  (brew install ffmpeg)
+  ${CYAN}Requirements:${RESET}  ffmpeg / ffprobe (brew install ffmpeg), pv (brew install pv)
 EOF
 }
 
@@ -117,6 +117,7 @@ DST_DIR="${DST_DIR/#\~/$HOME}"
 [ -d "$DST_DIR" ] || { echo -e "${RED}Error:${RESET} destination not found: $DST_DIR"; exit 1; }
 command -v ffmpeg  &>/dev/null || { echo -e "${RED}Error:${RESET} ffmpeg not found — install with: brew install ffmpeg"; exit 1; }
 command -v ffprobe &>/dev/null || { echo -e "${RED}Error:${RESET} ffprobe not found — install with: brew install ffmpeg"; exit 1; }
+command -v pv      &>/dev/null || { echo -e "${RED}Error:${RESET} pv not found — install with: brew install pv"; exit 1; }
 
 # ── Detect FAT32 ───────────────────────────────────────────────────────────────
 APPLY_LIMIT=false
@@ -156,7 +157,7 @@ for src in "${SMALL_FILES[@]}"; do
   sz=$(stat -f "%z" "$src")
   dst="$DST_DIR/$name"
   log "Copying ($(fmt_bytes "$sz")): $name"
-  if rsync --info=progress2 "$src" "$dst"; then
+  if pv "$src" > "$dst"; then
     if verify_file "$dst" "$sz"; then
       ok "$name"
       TO_DELETE+=("$src")
