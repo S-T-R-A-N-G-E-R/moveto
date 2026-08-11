@@ -156,7 +156,7 @@ for src in "${SMALL_FILES[@]}"; do
   sz=$(stat -f "%z" "$src")
   dst="$DST_DIR/$name"
   log "Copying ($(fmt_bytes "$sz")): $name"
-  if cp "$src" "$dst" 2>/dev/null; then
+  if rsync --info=progress2 "$src" "$dst"; then
     if verify_file "$dst" "$sz"; then
       ok "$name"
       TO_DELETE+=("$src")
@@ -195,7 +195,7 @@ for src in "${LARGE_FILES[@]}"; do
 
   mkdir -p "$subfolder" || { fail "mkdir failed: $subfolder"; FAILED+=("$name"); continue; }
 
-  if ! ffmpeg -hide_banner -loglevel warning \
+  if ! ffmpeg -hide_banner -loglevel error -stats \
        -i "$src" \
        -c copy -f segment -segment_time "$SPLIT_SECS" -reset_timestamps 1 \
        "$subfolder/part%03d.$ext"; then
