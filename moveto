@@ -157,7 +157,7 @@ for src in "${SMALL_FILES[@]}"; do
   sz=$(stat -f "%z" "$src")
   dst="$DST_DIR/$name"
   log "Copying ($(fmt_bytes "$sz")): $name"
-  if pv "$src" > "$dst" || cp "$src" "$dst"; then
+  if { timeout 2 head -c 1 "$src" > /dev/null 2>&1 && pv "$src" > "$dst"; } || cp "$src" "$dst"; then
     if verify_file "$dst" "$sz"; then
       ok "$name"
       TO_DELETE+=("$src")
